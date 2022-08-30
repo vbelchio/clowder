@@ -395,10 +395,10 @@ func (r *ClowdEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	for _, step := range steps {
 		result, err := step(&provider, &cache)
-		if err.Error() == SKIPRECONCILE {
-			return result, nil
-		}
 		if err != nil {
+			if err.Error() == SKIPRECONCILE {
+				return result, nil
+			}
 			return result, err
 		}
 	}
