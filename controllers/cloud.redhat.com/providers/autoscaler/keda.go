@@ -98,7 +98,11 @@ func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvi
 		"serverAddress": env.Status.Prometheus.Hostname,
 	}
 
-	return triggers[triggerType]
+	reVal, ok := triggers[triggerType]
+	if !ok {
+		return nil
+	}
+	return reVal
 
 	// The following are the possible triggers for the keda autoscaler.
 	// See https://github.com/kedacore/keda/blob/main/pkg/scaling/scale_handler.go#L313.
