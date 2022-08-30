@@ -88,42 +88,6 @@ func initAutoScaler(env *crd.ClowdEnvironment, app *crd.ClowdApp, d *apps.Deploy
 }
 
 func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvironment) map[string]string {
-	triggers := map[string]map[string]string{
-		"kafka": {
-			"bootstrapServers": fmt.Sprintf("%s:%d", c.Kafka.Brokers[0].Hostname, *c.Kafka.Brokers[0].Port),
-		},
-		"prometheus": {
-			"serverAddress": env.Status.Prometheus.Hostname,
-		},
-	}
-	reVal, ok := triggers[triggerType]
-	if !ok {
-		return map[string]string{}
-	}
-	return reVal
-}
-
-/*
-
-func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvironment) map[string]string {
-	var retVal map[string]string
-	var ok bool
-	triggers := map[string]map[string]string{
-		"kafka": {
-			"bootstrapServers": fmt.Sprintf("%s:%d", c.Kafka.Brokers[0].Hostname, *c.Kafka.Brokers[0].Port),
-		},
-		"prometheus": {
-			"serverAddress": env.Status.Prometheus.Hostname,
-		},
-	}
-	retVal, ok = triggers[triggerType]
-	if !ok {
-		return map[string]string{}
-	}
-	return retVal
-}
-
-func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvironment) map[string]string {
 	result := map[string]string{}
 	switch triggerType {
 	case "kafka":
@@ -178,4 +142,3 @@ func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvi
 	}
 	return result
 }
-*/
