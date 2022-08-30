@@ -88,67 +88,75 @@ func initAutoScaler(env *crd.ClowdEnvironment, app *crd.ClowdApp, d *apps.Deploy
 }
 
 func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvironment) map[string]string {
-	triggers := map[string]map[string]string{}
-
-	triggers["kafka"] = map[string]string{
-		"bootstrapServers": fmt.Sprintf("%s:%d", c.Kafka.Brokers[0].Hostname, *c.Kafka.Brokers[0].Port),
+	triggers := map[string]map[string]string{
+		"kafka": {
+			"bootstrapServers": fmt.Sprintf("%s:%d", c.Kafka.Brokers[0].Hostname, *c.Kafka.Brokers[0].Port),
+		},
+		"prometheus": {
+			"serverAddress": env.Status.Prometheus.Hostname,
+		},
 	}
-
-	triggers["prometheus"] = map[string]string{
-		"serverAddress": env.Status.Prometheus.Hostname,
-	}
-
 	reVal, ok := triggers[triggerType]
 	if !ok {
 		return nil
 	}
 	return reVal
+}
+
+/*
+func getTriggerRouteOld(triggerType string, c *config.AppConfig, env *crd.ClowdEnvironment) map[string]string {
+	result := map[string]string{}
+	switch triggerType {
+	case "kafka":
+		result["bootstrapServers"] = fmt.Sprintf("%s:%d", c.Kafka.Brokers[0].Hostname, *c.Kafka.Brokers[0].Port)
+	case "prometheus":
+		result["serverAddress"] = env.Status.Prometheus.Hostname
 
 	// The following are the possible triggers for the keda autoscaler.
 	// See https://github.com/kedacore/keda/blob/main/pkg/scaling/scale_handler.go#L313.
 	// These are here in case we need to pull clowdapp config info into
 	// the keda autoscaler.
-	/*
-		case "artemis-queue":
-		case "aws-cloudwatch":
-		case "aws-kinesis-stream":
-		case "aws-sqs-queue":
-		case "azure-blob":
-		case "azure-eventhub":
-		case "azure-log-analytics":
-		case "azure-monitor":
-		case "azure-pipelines":
-		case "azure-queue":
-		case "azure-servicebus":
-		case "cpu":
-		case "cron":
-		case "external":
-		case "external-push":
-		case "gcp-pubsub":
-		case "graphite":
-		case "huawei-cloudeye":
-		case "ibmmq":
-		case "influxdb":
-		case "kubernetes-workload":
-		case "liiklus":
-		case "memory":
-		case "metrics-api":
-		case "mongodb":
-		case "mssql":
-		case "mysql":
-		case "openstack-metric":
-		case "openstack-swift":
-		case "postgresql":
-		case "rabbitmq":
-		case "redis":
-		case "redis-cluster":
-		case "redis-cluster-streams":
-		case "redis-streams":
-		case "selenium-grid":
-		case "solace-event-queue":
-		case "stan":
-		default:
-			return nil
-		}
-	*/
+	case "artemis-queue":
+	case "aws-cloudwatch":
+	case "aws-kinesis-stream":
+	case "aws-sqs-queue":
+	case "azure-blob":
+	case "azure-eventhub":
+	case "azure-log-analytics":
+	case "azure-monitor":
+	case "azure-pipelines":
+	case "azure-queue":
+	case "azure-servicebus":
+	case "cpu":
+	case "cron":
+	case "external":
+	case "external-push":
+	case "gcp-pubsub":
+	case "graphite":
+	case "huawei-cloudeye":
+	case "ibmmq":
+	case "influxdb":
+	case "kubernetes-workload":
+	case "liiklus":
+	case "memory":
+	case "metrics-api":
+	case "mongodb":
+	case "mssql":
+	case "mysql":
+	case "openstack-metric":
+	case "openstack-swift":
+	case "postgresql":
+	case "rabbitmq":
+	case "redis":
+	case "redis-cluster":
+	case "redis-cluster-streams":
+	case "redis-streams":
+	case "selenium-grid":
+	case "solace-event-queue":
+	case "stan":
+	default:
+		return nil
+	}
+	return result
 }
+*/
