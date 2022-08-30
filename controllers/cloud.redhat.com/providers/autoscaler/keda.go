@@ -87,6 +87,7 @@ func initAutoScaler(env *crd.ClowdEnvironment, app *crd.ClowdApp, d *apps.Deploy
 	s.Spec = scalerSpec
 }
 
+/*
 func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvironment) map[string]string {
 	triggers := map[string]map[string]string{
 		"kafka": {
@@ -102,9 +103,9 @@ func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvi
 	}
 	return reVal
 }
+*/
 
-/*
-func getTriggerRouteOld(triggerType string, c *config.AppConfig, env *crd.ClowdEnvironment) map[string]string {
+func getTriggerRoute(triggerType string, c *config.AppConfig, env *crd.ClowdEnvironment) map[string]string {
 	result := map[string]string{}
 	switch triggerType {
 	case "kafka":
@@ -159,4 +160,3 @@ func getTriggerRouteOld(triggerType string, c *config.AppConfig, env *crd.ClowdE
 	}
 	return result
 }
-*/
