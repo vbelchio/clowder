@@ -76,7 +76,10 @@ import (
 var mu sync.RWMutex
 var cEnv = ""
 
-const envFinalizer = "finalizer.env.cloud.redhat.com"
+const (
+	envFinalizer  = "finalizer.env.cloud.redhat.com"
+	SKIPRECONCILE = "SKIPRECONCILE"
+)
 
 // ClowdEnvironmentReconciler reconciles a ClowdEnvironment object
 type ClowdEnvironmentReconciler struct {
@@ -107,21 +110,243 @@ func ReadEnv() string {
 	return cEnv
 }
 
-//Reconcile fn
+//Before reconciliation we perform some sanity checks and bail out if any of them fail
+func (r *ClowdEnvironmentReconciler) reconcileGuard(ctx context.Context, req ctrl.Request, env *crd.ClowdEnvironment, log logr.Logger) (bool, error) {
+	canReconcile := true
+	if getEnvErr := r.Client.Get(ctx, req.NamespacedName, env); getEnvErr != nil {
+		if k8serr.IsNotFound(getEnvErr) {
+			// Must have been deleted
+			return false, nil
+		}
+		log.Info("Namespace not found", "err", getEnvErr)
+		return false, getEnvErr
+	}
+	return canReconcile, nil
+}
+
+//Determine if an env has been marked for deletion. If so deal with finalizaers.
+func (r *ClowdEnvironmentReconciler) markedForDeletion(provider *providers.Provider, _ *rc.ObjectCache) (ctrl.Result, error) {
+	isEnvMarkedForDeletion := provider.Env.GetDeletionTimestamp() != nil
+	if !isEnvMarkedForDeletion {
+		return ctrl.Result{}, nil
+	}
+	if contains(provider.Env.GetFinalizers(), envFinalizer) {
+		if finalizeErr := r.finalizeEnvironment(provider.Log, provider.Env, *provider); finalizeErr != nil {
+			provider.Log.Info("Cloud not finalize", "err", finalizeErr)
+			return ctrl.Result{Requeue: true}, finalizeErr
+		}
+
+		controllerutil.RemoveFinalizer(provider.Env, envFinalizer)
+		removeFinalizeErr := r.Update(provider.Ctx, provider.Env)
+		if removeFinalizeErr != nil {
+			provider.Log.Info("Cloud not remove finalizer", "err", removeFinalizeErr)
+			return ctrl.Result{}, removeFinalizeErr
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+//Add finalizer to the environment if it doesn't have it already
+func (r *ClowdEnvironmentReconciler) addFinalizerForCR(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	// Add finalizer for this CR
+	if !contains(provider.Env.GetFinalizers(), envFinalizer) {
+		if addFinalizeErr := r.addFinalizer(provider.Log, provider.Env); addFinalizeErr != nil {
+			provider.Log.Info("Could not add finalizer", "err", addFinalizeErr)
+			return ctrl.Result{}, addFinalizeErr
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+//Get the target namespace for the environment
+func (r *ClowdEnvironmentReconciler) getTargetNamespace(env *crd.ClowdEnvironment, ctx context.Context, log logr.Logger) (reconcile.Result, error) {
+	namespace := core.Namespace{}
+	namespaceName := types.NamespacedName{
+		Name: env.Spec.TargetNamespace,
+	}
+	if nErr := r.Client.Get(ctx, namespaceName, &namespace); nErr != nil {
+		log.Info("Namespace get error", "err", nErr)
+		r.Recorder.Eventf(env, "Warning", "NamespaceMissing", "Requested Target Namespace [%s] is missing", env.Spec.TargetNamespace)
+		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, env, crd.ReconciliationFailed, nErr); setClowdStatusErr != nil {
+			log.Info("Set status error", "err", setClowdStatusErr)
+			return ctrl.Result{Requeue: true}, setClowdStatusErr
+		}
+		return ctrl.Result{Requeue: true}, nErr
+	}
+	env.Status.TargetNamespace = env.Spec.TargetNamespace
+	return ctrl.Result{}, nil
+}
+
+//Create a target namespace for the environment if none is present
+func (r *ClowdEnvironmentReconciler) createTargetNamespace(env *crd.ClowdEnvironment, ctx context.Context, log logr.Logger) (reconcile.Result, error) {
+	env.Status.TargetNamespace = env.GenerateTargetNamespace()
+	namespace := &core.Namespace{}
+	namespace.SetName(env.Status.TargetNamespace)
+	if snErr := r.Client.Create(ctx, namespace); snErr != nil {
+		log.Info("Namespace create error", "err", snErr)
+		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, env, crd.ReconciliationFailed, snErr); setClowdStatusErr != nil {
+			log.Info("Set status error", "err", setClowdStatusErr)
+			return ctrl.Result{Requeue: true}, setClowdStatusErr
+		}
+		return ctrl.Result{Requeue: true}, snErr
+	}
+	return ctrl.Result{}, nil
+}
+
+//Update the target namespace for the environment if it has changed
+func (r *ClowdEnvironmentReconciler) updateNamespace(env *crd.ClowdEnvironment, ctx context.Context, log logr.Logger) (reconcile.Result, error) {
+	if statErr := r.Client.Status().Update(ctx, env); statErr != nil {
+		log.Info("Namespace create error", "err", statErr)
+		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, env, crd.ReconciliationFailed, statErr); setClowdStatusErr != nil {
+			log.Info("Set status error", "err", setClowdStatusErr)
+			return ctrl.Result{Requeue: true}, setClowdStatusErr
+		}
+		return ctrl.Result{Requeue: true}, statErr
+	}
+	return ctrl.Result{}, nil
+}
+
+//Set up the target namespace for the env. This is highly conditional. We may create or get a namespace, then update and finally update it
+func (r *ClowdEnvironmentReconciler) setupNamespace(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	if provider.Env.Status.TargetNamespace != "" {
+		return ctrl.Result{}, nil
+	}
+
+	if provider.Env.Spec.TargetNamespace == "" {
+		result, err := r.createTargetNamespace(provider.Env, provider.Ctx, provider.Log)
+		if err != nil {
+			return result, err
+		}
+	} else {
+		result, err := r.getTargetNamespace(provider.Env, provider.Ctx, provider.Log)
+		if err != nil {
+			return result, err
+		}
+	}
+
+	result, err := r.updateNamespace(provider.Env, provider.Ctx, provider.Log)
+	if err != nil {
+		return result, err
+	}
+
+	return ctrl.Result{}, nil
+
+}
+
+//Verify that the target namespace exists and hasn't been deleted
+func (r *ClowdEnvironmentReconciler) verifyNamespace(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	ens := &core.Namespace{}
+	if getNSErr := r.Client.Get(provider.Ctx, types.NamespacedName{Name: provider.Env.Status.TargetNamespace}, ens); getNSErr != nil {
+		return ctrl.Result{Requeue: true}, getNSErr
+	}
+
+	if ens.ObjectMeta.DeletionTimestamp != nil {
+		provider.Log.Info("Env target namespace is to be deleted - skipping reconcile")
+		return ctrl.Result{}, errors.New(SKIPRECONCILE)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *ClowdEnvironmentReconciler) clowdStatusErrorWrapper(msg string, errorToHandle error, log logr.Logger, env *crd.ClowdEnvironment, ctx context.Context) (reconcile.Result, error) {
+	if errorToHandle != nil {
+		log.Info(msg, "err", errorToHandle)
+		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, env, crd.ReconciliationFailed, errorToHandle); setClowdStatusErr != nil {
+			log.Info("Set status error", "err", setClowdStatusErr)
+			return ctrl.Result{Requeue: true}, setClowdStatusErr
+		}
+		return ctrl.Result{Requeue: true}, errorToHandle
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *ClowdEnvironmentReconciler) getResourceStatus(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	envReady, _, getEnvResErr := GetEnvResourceStatus(provider.Ctx, r.Client, provider.Env)
+	if getEnvResErr != nil {
+		provider.Log.Info("GetEnvResourceStatus error", "err", getEnvResErr)
+		return ctrl.Result{Requeue: true}, getEnvResErr
+	}
+
+	envStatus := core.ConditionFalse
+	successCond := cond.Get(provider.Env, crd.ReconciliationSuccessful)
+	if successCond != nil {
+		envStatus = successCond.Status
+	}
+
+	provider.Env.Status.Ready = envReady && (envStatus == core.ConditionTrue)
+	provider.Env.Status.Generation = provider.Env.Generation
+
+	return ctrl.Result{}, nil
+}
+
+func (r *ClowdEnvironmentReconciler) setFinalStatus(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	finalStatusErr := r.Client.Status().Update(provider.Ctx, provider.Env)
+	if finalStatusErr == nil {
+		return ctrl.Result{}, nil
+	}
+	provider.Log.Info("Final Status error", "err", finalStatusErr)
+	setClowdStatusErr := SetClowdEnvConditions(provider.Ctx, r.Client, provider.Env, crd.ReconciliationFailed, finalStatusErr)
+	if setClowdStatusErr == nil {
+		return ctrl.Result{Requeue: true}, finalStatusErr
+	}
+	provider.Log.Info("Set status error", "err", setClowdStatusErr)
+	return ctrl.Result{Requeue: true}, setClowdStatusErr
+}
+
+func (r *ClowdEnvironmentReconciler) runProviders(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	return r.clowdStatusErrorWrapper("Error running providers", runProvidersForEnv(provider.Log, *provider), provider.Log, provider.Env, provider.Ctx)
+}
+
+func (r *ClowdEnvironmentReconciler) applyCache(provider *providers.Provider, cache *rc.ObjectCache) (reconcile.Result, error) {
+	return r.clowdStatusErrorWrapper("Cache Error", cache.ApplyAll(), provider.Log, provider.Env, provider.Ctx)
+}
+
+func (r *ClowdEnvironmentReconciler) setAppInfoWrapper(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	return r.clowdStatusErrorWrapper("setAppInfo error", r.setAppInfo(*provider), provider.Log, provider.Env, provider.Ctx)
+}
+
+func (r *ClowdEnvironmentReconciler) setResourceStatus(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	return r.clowdStatusErrorWrapper("SetEnvResourceStatus error", SetEnvResourceStatus(provider.Ctx, r.Client, provider.Env), provider.Log, provider.Env, provider.Ctx)
+}
+
+func (r *ClowdEnvironmentReconciler) setPrometheusStatus(provider *providers.Provider, _ *rc.ObjectCache) (reconcile.Result, error) {
+	setPrometheusStatus(provider.Env)
+	return ctrl.Result{}, nil
+}
+
+func (r *ClowdEnvironmentReconciler) deleteUnunsedResources(provider *providers.Provider, cache *rc.ObjectCache) (reconcile.Result, error) {
+	opts := []client.ListOption{
+		client.MatchingLabels{provider.Env.GetPrimaryLabel(): provider.Env.GetClowdName()},
+	}
+
+	// Delete all resources that are not used anymore
+	rErr := cache.Reconcile(provider.Env.GetUID(), opts...)
+	if rErr != nil {
+		return ctrl.Result{Requeue: true}, rErr
+	}
+
+	if successSetErr := SetClowdEnvConditions(provider.Ctx, r.Client, provider.Env, crd.ReconciliationSuccessful, nil); successSetErr != nil {
+		provider.Log.Info("Set status error", "err", successSetErr)
+		return ctrl.Result{Requeue: true}, successSetErr
+	}
+
+	return ctrl.Result{}, nil
+}
+
+//ClowdEnvironmentReconciler reconciles a ClowdEnvironment
 func (r *ClowdEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("env", req.Name).WithValues("rid", utils.RandString(5))
 	ctx = context.WithValue(ctx, errors.ClowdKey("log"), &log)
 	ctx = context.WithValue(ctx, errors.ClowdKey("recorder"), &r.Recorder)
 	env := crd.ClowdEnvironment{}
 
-	if getEnvErr := r.Client.Get(ctx, req.NamespacedName, &env); getEnvErr != nil {
-		if k8serr.IsNotFound(getEnvErr) {
-			// Must have been deleted
-			return ctrl.Result{}, nil
-		}
-		log.Info("Namespace not found", "err", getEnvErr)
-		return ctrl.Result{}, getEnvErr
+	canReconcile, err := r.reconcileGuard(ctx, req, &env, log)
+	if !canReconcile {
+		return ctrl.Result{}, err
 	}
+
+	SetEnv(env.Name)
+	defer ReleaseEnv()
 
 	if _, ok := presentEnvironments[env.Name]; !ok {
 		presentEnvironments[env.Name] = true
@@ -148,174 +373,34 @@ func (r *ClowdEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		Log:    log,
 	}
 
-	isEnvMarkedForDeletion := env.GetDeletionTimestamp() != nil
-	if isEnvMarkedForDeletion {
-		if contains(env.GetFinalizers(), envFinalizer) {
-			if finalizeErr := r.finalizeEnvironment(log, &env, provider); finalizeErr != nil {
-				log.Info("Cloud not finalize", "err", finalizeErr)
-				return ctrl.Result{Requeue: true}, finalizeErr
-			}
+	//So, we've entered into a sort of a workqueue type system here
+	//The right way to build this out it to create a type and interface for ReconcileStep
+	//And then move all of these methods into new ReconcileStep implementations
+	//I started to do that but it is too big for this refactor
+	//This hints at how it would look
+	steps := []func(*providers.Provider, *rc.ObjectCache) (ctrl.Result, error){
+		r.markedForDeletion,
+		r.addFinalizerForCR,
+		r.setupNamespace,
+		r.verifyNamespace,
+		r.runProviders,
+		r.applyCache,
+		r.setAppInfoWrapper,
+		r.setResourceStatus,
+		r.setPrometheusStatus,
+		r.getResourceStatus,
+		r.setFinalStatus,
+		r.deleteUnunsedResources,
+	}
 
-			controllerutil.RemoveFinalizer(&env, envFinalizer)
-			removeFinalizeErr := r.Update(ctx, &env)
-			if removeFinalizeErr != nil {
-				log.Info("Cloud not remove finalizer", "err", removeFinalizeErr)
-				return ctrl.Result{}, removeFinalizeErr
-			}
+	for _, step := range steps {
+		result, err := step(&provider, &cache)
+		if err.Error() == SKIPRECONCILE {
+			return result, nil
 		}
-		return ctrl.Result{}, nil
-	}
-
-	// Add finalizer for this CR
-	if !contains(env.GetFinalizers(), envFinalizer) {
-		if addFinalizeErr := r.addFinalizer(log, &env); addFinalizeErr != nil {
-			log.Info("Cloud not add finalizer", "err", addFinalizeErr)
-			return ctrl.Result{}, addFinalizeErr
+		if err != nil {
+			return result, err
 		}
-	}
-
-	log.Info("Reconciliation started")
-
-	if clowderconfig.LoadedConfig.Features.PerProviderMetrics {
-		requestMetrics.With(prometheus.Labels{"type": "env", "name": env.Name}).Inc()
-	}
-
-	if env.Spec.Disabled {
-		log.Info("Reconciliation aborted - set to be disabled")
-		return ctrl.Result{}, nil
-	}
-
-	if env.Status.TargetNamespace == "" {
-		if env.Spec.TargetNamespace != "" {
-			namespace := core.Namespace{}
-			namespaceName := types.NamespacedName{
-				Name: env.Spec.TargetNamespace,
-			}
-			if nErr := r.Client.Get(ctx, namespaceName, &namespace); nErr != nil {
-				log.Info("Namespace get error", "err", nErr)
-				r.Recorder.Eventf(&env, "Warning", "NamespaceMissing", "Requested Target Namespace [%s] is missing", env.Spec.TargetNamespace)
-				if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationFailed, nErr); setClowdStatusErr != nil {
-					log.Info("Set status error", "err", setClowdStatusErr)
-					return ctrl.Result{Requeue: true}, setClowdStatusErr
-				}
-				return ctrl.Result{Requeue: true}, nErr
-			}
-			env.Status.TargetNamespace = env.Spec.TargetNamespace
-		} else {
-			env.Status.TargetNamespace = env.GenerateTargetNamespace()
-			namespace := &core.Namespace{}
-			namespace.SetName(env.Status.TargetNamespace)
-			if snErr := r.Client.Create(ctx, namespace); snErr != nil {
-				log.Info("Namespace create error", "err", snErr)
-				if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationFailed, snErr); setClowdStatusErr != nil {
-					log.Info("Set status error", "err", setClowdStatusErr)
-					return ctrl.Result{Requeue: true}, setClowdStatusErr
-				}
-				return ctrl.Result{Requeue: true}, snErr
-			}
-		}
-
-		if statErr := r.Client.Status().Update(ctx, &env); statErr != nil {
-			log.Info("Namespace create error", "err", statErr)
-			if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationFailed, statErr); setClowdStatusErr != nil {
-				log.Info("Set status error", "err", setClowdStatusErr)
-				return ctrl.Result{Requeue: true}, setClowdStatusErr
-			}
-			return ctrl.Result{Requeue: true}, statErr
-		}
-	}
-
-	ens := &core.Namespace{}
-	if getNSErr := r.Client.Get(ctx, types.NamespacedName{Name: env.Status.TargetNamespace}, ens); getNSErr != nil {
-		return ctrl.Result{Requeue: true}, getNSErr
-	}
-
-	if ens.ObjectMeta.DeletionTimestamp != nil {
-		log.Info("Env target namespace is to be deleted - skipping reconcile")
-		return ctrl.Result{}, nil
-	}
-
-	SetEnv(env.Name)
-	defer ReleaseEnv()
-	provErr := runProvidersForEnv(log, provider)
-
-	if provErr != nil {
-		log.Info("Prov err", "err", provErr)
-		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationFailed, provErr); setClowdStatusErr != nil {
-			log.Info("Set status error", "err", setClowdStatusErr)
-			return ctrl.Result{Requeue: true}, setClowdStatusErr
-		}
-		return ctrl.Result{Requeue: true}, provErr
-	}
-
-	cacheErr := cache.ApplyAll()
-
-	if cacheErr != nil {
-		log.Info("Cache error", "err", cacheErr)
-		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationFailed, cacheErr); setClowdStatusErr != nil {
-			log.Info("Set status error", "err", setClowdStatusErr)
-			return ctrl.Result{Requeue: true}, setClowdStatusErr
-		}
-		return ctrl.Result{Requeue: true}, cacheErr
-	}
-
-	if setAppErr := r.setAppInfo(provider); setAppErr != nil {
-		log.Info("setAppInfo error", "err", setAppErr)
-		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationFailed, setAppErr); setClowdStatusErr != nil {
-			log.Info("Set status error", "err", setClowdStatusErr)
-			return ctrl.Result{Requeue: true}, setClowdStatusErr
-		}
-		return ctrl.Result{Requeue: true}, setAppErr
-	}
-
-	if statusErr := SetEnvResourceStatus(ctx, r.Client, &env); statusErr != nil {
-		log.Info("SetEnvResourceStatus error", "err", statusErr)
-		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationFailed, statusErr); setClowdStatusErr != nil {
-			log.Info("Set status error", "err", setClowdStatusErr)
-			return ctrl.Result{Requeue: true}, setClowdStatusErr
-		}
-		return ctrl.Result{Requeue: true}, statusErr
-	}
-
-	setPrometheusStatus(&env)
-
-	envReady, _, getEnvResErr := GetEnvResourceStatus(ctx, r.Client, &env)
-	if getEnvResErr != nil {
-		log.Info("GetEnvResourceStatus error", "err", getEnvResErr)
-		return ctrl.Result{Requeue: true}, getEnvResErr
-	}
-
-	envStatus := core.ConditionFalse
-	successCond := cond.Get(&env, crd.ReconciliationSuccessful)
-	if successCond != nil {
-		envStatus = successCond.Status
-	}
-
-	env.Status.Ready = envReady && (envStatus == core.ConditionTrue)
-	env.Status.Generation = env.Generation
-
-	if finalStatusErr := r.Client.Status().Update(ctx, &env); finalStatusErr != nil {
-		log.Info("Final Status error", "err", finalStatusErr)
-		if setClowdStatusErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationFailed, finalStatusErr); setClowdStatusErr != nil {
-			log.Info("Set status error", "err", setClowdStatusErr)
-			return ctrl.Result{Requeue: true}, setClowdStatusErr
-		}
-		return ctrl.Result{Requeue: true}, finalStatusErr
-	}
-
-	opts := []client.ListOption{
-		client.MatchingLabels{env.GetPrimaryLabel(): env.GetClowdName()},
-	}
-
-	// Delete all resources that are not used anymore
-	rErr := cache.Reconcile(env.GetUID(), opts...)
-	if rErr != nil {
-		return ctrl.Result{Requeue: true}, rErr
-	}
-
-	if successSetErr := SetClowdEnvConditions(ctx, r.Client, &env, crd.ReconciliationSuccessful, nil); successSetErr != nil {
-		log.Info("Set status error", "err", successSetErr)
-		return ctrl.Result{Requeue: true}, successSetErr
 	}
 
 	managedEnvironments[env.Name] = true
